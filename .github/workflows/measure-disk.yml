@@ -1,0 +1,89 @@
+name: Measure runner disk
+
+# Throwaway: measures how much disk a GitHub-hosted runner leaves for one dataset test, to set
+# the size threshold for the `large` marker. Runs on the fork only.
+on:
+  push:
+    branches: [measure-runner-disk]
+  workflow_dispatch:
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [Food101, AWA2]
+    steps:
+      - name: Checking Out Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      # Same install as the Testing workflow, so the free space below is what a test sees.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,benchmarks]"
+
+      - name: Disk space after setup
+        run: |
+          echo "Runner image: $ImageOS $ImageVersion"
+          df -h
+
+      - name: Load ${{ matrix.dataset }} while sampling free disk space
+        env:
+          DATASET: ${{ matrix.dataset }}
+        run: |
+          python - <<'EOF'
+          import json, os, shutil, threading, time
+          from pathlib import Path
+
+          import stable_datasets.images as images
+          from stable_datasets.utils import _default_dest_folder, _default_processed_cache_dir
+
+          mounts = [m for m in ("/", "/mnt") if os.path.exists(m)]
+          start = {m: shutil.disk_usage(m).free for m in mounts}
+          lowest = dict(start)
+          done = threading.Event()
+
+          def sample():
+              while not done.is_set():
+                  for m in mounts:
+                      lowest[m] = min(lowest[m], shutil.disk_usage(m).free)
+                  time.sleep(1)
+
+          sampler = threading.Thread(target=sample, daemon=True)
+          sampler.start()
+          t0 = time.time()
+          getattr(images, os.environ["DATASET"])()  # every split, as the tests load them
+          minutes = (time.time() - t0) / 60
+          done.set()
+          sampler.join()
+
+          def size(path):
+              path = Path(path)
+              return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) if path.exists() else 0
+
+          gb = 1e9
+          download, processed = size(_default_dest_folder()), size(_default_processed_cache_dir())
+          peak = start["/"] - lowest["/"]
+          result = {
+              "dataset": os.environ["DATASET"],
+              "minutes": round(minutes, 1),
+              "free_at_start_gb": {m: round(v / gb, 2) for m, v in start.items()},
+              "lowest_free_gb": {m: round(v / gb, 2) for m, v in lowest.items()},
+              "download_gb": round(download / gb, 2),
+              "processed_cache_gb": round(processed / gb, 2),
+              "peak_used_gb": round(peak / gb, 2),
+              "peak_per_download_gb": round(peak / download, 2) if download else None,
+          }
+          print(json.dumps(result, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("```json\n" + json.dumps(result, indent=2) + "\n```\n")
+          EOF
